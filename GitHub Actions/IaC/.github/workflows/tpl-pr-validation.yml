@@ -1,0 +1,142 @@
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'The environment to use for the PR validation'
+        required: true
+        type: string
+      tf-plan-continue-on-error:
+        description: 'It will break the workflow if any error occurs during the plan phase'
+        required: false
+        default: false
+        type: boolean
+
+    secrets:
+      ARM_CLIENT_ID:
+        required: true
+      ARM_CLIENT_SECRET:
+        required: true
+      ARM_SUBSCRIPTION_ID:
+        required: true
+      ARM_TENANT_ID:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      INFRACOST_API_KEY:
+        required: true
+
+jobs:
+  terraform:
+    env:
+      working-directory: './terraform'
+      tf-plan-continue-on-error: ${{ inputs.tf-plan-continue-on-error }}
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v1
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Terraform Format
+        working-directory: ${{ env.working-directory }}
+        id: fmt
+        run: terraform fmt
+
+      - name: Terraform Init
+        working-directory: ${{ env.working-directory }}
+        id: init
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: ${{ env.working-directory }}
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Workspace Select
+        working-directory: ${{ env.working-directory }}
+        id: workspace
+        run: terraform workspace select ${{ inputs.environment }}
+
+      - name: Terraform Plan
+        working-directory: ${{ env.working-directory }}
+        id: plan
+        run: terraform plan -out=${{ inputs.environment }}.binary -no-color
+        continue-on-error: ${{ env.tf-plan-continue-on-error }}
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        working-directory: ${{ env.working-directory }}
+        run: exit 1
+
+      - name: Terraform Show Output
+        id: show-output
+        working-directory: ${{ env.working-directory }}
+        run: terraform show -json ${{ inputs.environment }}.binary > ${{ inputs.environment }}.json
+
+      - name: TFSec Commenter
+        id: tfsec-commenter
+        uses: aquasecurity/tfsec-pr-commenter-action@v1.0.2
+        with:
+          working_directory: ${{ env.working-directory }}
+          github_token: ${{ github.token }}
+          soft_fail_commenter: true
+
+      - name: Generate Infracost JSON
+        id: generate-infracost-json
+        run: infracost breakdown --path ${{ inputs.environment }}.json --format json --out-file ./infracost-${{ inputs.environment }}.json
+        working-directory: ${{ env.working-directory }}
+
+      - name: Post Infracost comment
+        id: post-infracost-comment
+        uses: infracost/actions/comment@v1
+        with:
+          path: ${{ env.working-directory }}/infracost-${{ inputs.environment }}.json
+          tag: ${{ inputs.environment }}
+          behavior: update
+
+      # ################################################################################
+      # # POST RESULTS
+      # ################################################################################
+
+      - uses: actions/github-script@v6
+        env:
+          PLAN: 'terraform\n${{ steps.plan.outputs.stdout }}'
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            #### TFSec Scan 👮\`${{ steps.tfsec-commenter.outcome }}\`
+
+            <details><summary>Show Plan for ${{ inputs.environment }} environment</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })

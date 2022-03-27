@@ -1,0 +1,184 @@
+parameters:
+  - name: tfVersion
+    type: string
+    default: '1.1.4'
+  - name: environment
+  - name: sshKeySecureFile
+    type: string
+    default: 'id_rsa'
+  - name: tfSecretValues
+    type: string
+    default: ''
+  - name: tfDefaultStateName
+    default: $(Build.Repository.Name)
+  - name: serviceConnectionName
+  - name: aditionalTFVars
+    type: string
+    default: ''
+  - name: failTaskOnFailedTests
+    type: boolean
+    default: true
+
+stages:
+  - stage: TerraformPlan
+    dependsOn: []
+    variables:
+      - group: 'vg-${{ parameters.environment }}-iac-shared-devops-iac-deploy'
+      - group: 'vg-${{ parameters.environment }}-iac-shared-tfstates'
+      - name: tfDefaultStateName
+        value: $(Build.Repository.Name)
+      - name: tfStateName
+        value: $(tfDefaultStateName)
+      - name: tfValidateCliOptions
+        value: ''
+      - name: tfSecApiKey
+        value: ''
+      - name: tfPlanCliOptions
+        value: '-lock=false -input=false -out tfplan.binary -var-file=./${{ parameters.environment }}.tfvars ${{ parameters.aditionalTFVars }} -var="subscription_id=$(tf-subscription-id)" ${{ parameters.tfSecretValues }}'
+      - name: tfFileRepoDirectory
+        value: '$(System.DefaultWorkingDirectory)/terraform'
+    jobs:
+    - deployment: ValidateAndPlan
+      environment: 'iac-${{ parameters.environment }}'
+      pool:
+        name: 'Neogrid Deployment Linux Agent Pool'
+        demands:
+        - Agent.Name -equals az-devops-ag-01L    # Optional
+        # vmImage: ubuntu-latest
+      continueOnError: false
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: InstallSSHKey@0
+                displayName: 'Install SSH Key for Terraform Module Repository Access'
+                inputs:
+                  hostName: ssh.dev.azure.com
+                  knownHostsEntry: $(devops-tf-modules-access-knownhost)
+                  sshKeySecureFile: devops-tf-modules-access-key
+              - checkout: self
+              - task: Bash@3
+                inputs:
+                  targetType: inline
+                  script: ssh-keyscan -t rsa ssh.dev.azure.com >> ~/.ssh/known_hosts
+              - task: TerraformInstaller@0
+                displayName: 'Terraform Installation'
+                inputs:
+                  terraformVersion: ${{ parameters.tfVersion }}
+              - task: TerraformTaskV2@2
+                displayName: 'Terraform Initialization'
+                inputs:
+                  command: 'init'
+                  workingDirectory: $(tfFileRepoDirectory)
+                  backendAzureRmSubscriptionName: $(tf-subscription-id)
+                  backendServiceArm: ${{ parameters.serviceConnectionName }}
+                  backendAzureRmResourceGroupName: $(tf-backend-rg)
+                  backendAzureRmStorageAccountName: $(tf-backend-storage-account)
+                  backendAzureRmContainerName: $(tf-backend-container-name)
+                  backendAzureRmKey: '$(tfStateName).tfstate'
+                  failOnStderr: true
+              - task: TerraformTaskV2@2
+                displayName: 'Terraform Validation'
+                inputs:
+                  command: validate
+                  targetType: 'inline'
+                  commandOptions: $(tfValidateCliOptions)
+                  workingDirectory: $(tfFileRepoDirectory)
+                  failOnStderr: true
+              - task: TerraformTaskV2@2
+                displayName: 'Terraform Plan'
+                inputs:
+                  command: 'plan'
+                  provider: 'azurerm'
+                  targetType: 'inline'
+                  commandOptions: $(tfPlanCliOptions)
+                  workingDirectory: $(tfFileRepoDirectory)
+                  environmentServiceNameAzureRM: ${{ parameters.serviceConnectionName }}
+                  failOnStderr: true
+              - task: Bash@3
+                displayName: 'TFSec Static Code Analysis'
+                inputs:
+                  targetType: 'inline' # Optional. Options: filePath, inline
+                  script: sudo docker run --rm -t -v $(tfFileRepoDirectory):/src aquasec/tfsec:latest ./src --tfvars-file $(tfFileRepoDirectory)/${{ parameters.environment }}.tfvars --format JUnit > $(tfFileRepoDirectory)/TEST.xml;
+                          exit 0;
+              - task: PublishTestResults@2
+                inputs:
+                  testResultsFormat: 'JUnit' # Options: JUnit, NUnit, VSTest, xUnit, cTest
+                  testResultsFiles: '**/TEST.xml'
+                  searchFolder: '$(tfFileRepoDirectory)' # Optional
+                  failTaskOnFailedTests: ${{ parameters.failTaskOnFailedTests }} # Optional
+              - task: Bash@3
+                displayName: 'InfraCost Report'
+                inputs:
+                  targetType: 'inline' # Optional. Options: filePath, inline
+                  script: sudo docker run --rm -t -v $(tfFileRepoDirectory):/code/ -e INFRACOST_API_KEY=$(tfSecApiKey) -e INFRACOST_CURRENCY=BRL -e INFRACOST_TERRAFORM_BINARY=/usr/bin/terraform_1.0.10 infracost/infracost:latest breakdown --path /code/tfplan.binary;
+                          exit 0;
+
+  - stage: TerraformApply
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    dependsOn: TerraformPlan
+    variables:
+      - group: 'vg-${{ parameters.environment }}-iac-shared-devops-iac-deploy'
+      - group: 'vg-${{ parameters.environment }}-iac-shared-tfstates'
+      - name: tfDefaultStateName
+        value: $(Build.Repository.Name)
+      - name: tfStateName
+        value: $(tfDefaultStateName)
+      - name: tfApplyCliOptions
+        value: '-auto-approve -input=false -var-file=./${{ parameters.environment }}.tfvars ${{ parameters.aditionalTFVars }} -var="subscription_id=$(tf-subscription-id)" ${{ parameters.tfSecretValues }}'
+      - name: tfFileRepoDirectory
+        value: '$(System.DefaultWorkingDirectory)/terraform'
+    jobs:
+      - deployment: Apply
+        environment: 'iac-${{ parameters.environment }}-with-approval'
+        pool:
+          name: 'Neogrid Deployment Linux Agent Pool'
+          demands:
+          - Agent.Name -equals az-devops-ag-01L    # Optional
+          # vmImage: ubuntu-latest
+        continueOnError: false
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: InstallSSHKey@0
+                  displayName: 'Install SSH Key for Terraform Module Repository Access'
+                  inputs:
+                    # hostName: ssh.dev.azure.com
+                    knownHostsEntry: $(devops-tf-modules-access-knownhost)
+                    sshKeySecureFile: devops-tf-modules-access-key
+                - checkout: self
+                - task: Bash@3
+                  inputs:
+                    targetType: inline
+                    script: sudo apt install unzip
+                - task: Bash@3
+                  inputs:
+                    targetType: inline
+                    script: ssh-keyscan -t rsa ssh.dev.azure.com >> ~/.ssh/known_hosts
+                - task: TerraformInstaller@0
+                  displayName: 'Terraform Installation'
+                  inputs:
+                    terraformVersion: ${{ parameters.tfVersion }}
+                - task: TerraformTaskV2@2
+                  displayName: 'Terraform Initialization'
+                  inputs:
+                    command: 'init'
+                    workingDirectory: $(tfFileRepoDirectory)
+                    backendAzureRmSubscriptionName: $(tf-subscription-id)
+                    backendServiceArm: ${{ parameters.serviceConnectionName }}
+                    backendAzureRmResourceGroupName: $(tf-backend-rg)
+                    backendAzureRmStorageAccountName: $(tf-backend-storage-account)
+                    backendAzureRmContainerName: $(tf-backend-container-name)
+                    backendAzureRmKey: '$(tfStateName).tfstate'
+                    failOnStderr: true
+                - task: TerraformTaskV2@2
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    command: 'apply'
+                    provider: 'azurerm'
+                    targetType: 'inline'
+                    commandOptions: $(tfApplyCliOptions)
+                    workingDirectory: $(tfFileRepoDirectory)
+                    environmentServiceNameAzureRM: ${{ parameters.serviceConnectionName }}
+                    failOnStderr: true

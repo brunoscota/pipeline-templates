@@ -1,0 +1,14 @@
+trigger: none
+resources:
+  repositories:
+    - repository: iac-pipeline-templates
+      type: git
+      name: DevOps/iac-pipeline-templates
+
+
+## CHANGABLE PARAMETERS BELOW
+extends:
+  template: terraform/terraform-pipeline.yml@iac-pipeline-templates
+  parameters:
+    environment: prd
+    serviceConnectionName: sp-prd-iac-products-portalcolaborativo-01
